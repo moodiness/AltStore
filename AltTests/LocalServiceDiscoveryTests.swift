@@ -157,7 +157,7 @@ private final class ServiceRegistration
 {
     private var reference: DNSServiceRef?
     private let registered = XCTestExpectation(description: "Local-only service registration completes")
-    private var registrationError = kDNSServiceErr_NoError
+    private var registrationError = DNSServiceErrorType(kDNSServiceErr_NoError)
     private var receivedReply = false
 
     init(serviceType: String, port: UInt16) throws
