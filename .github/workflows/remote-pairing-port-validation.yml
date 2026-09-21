@@ -1,0 +1,109 @@
+name: Remote pairing port validation
+on:
+  push:
+    branches:
+      - 'validation/remote-pairing-port-*'
+permissions:
+  contents: read
+jobs:
+  discovery:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and exercise the production discovery code
+        shell: python
+        run: |
+          import os, pathlib, platform, shutil, socket, subprocess, tempfile, threading
+          repo = pathlib.Path.cwd()
+          package = pathlib.Path(tempfile.mkdtemp(prefix='altstore-port-'))
+          source = repo / 'AltStore/Server/LocalServiceDiscovery.swift'
+          for folder in ['Sources/AltStore', 'Sources/PortSmoke', 'Tests/DiscoveryTests']:
+              (package / folder).mkdir(parents=True)
+          shutil.copy2(source, package / 'Sources/AltStore/LocalServiceDiscovery.swift')
+          shutil.copy2(source, package / 'Sources/PortSmoke/LocalServiceDiscovery.swift')
+          shutil.copy2(repo / 'AltTests/LocalServiceDiscoveryTests.swift', package / 'Tests/DiscoveryTests/LocalServiceDiscoveryTests.swift')
+          (package / 'Package.swift').write_text('''// swift-tools-version: 6.0
+          import PackageDescription
+          let package = Package(
+              name: "PortValidation",
+              platforms: [.macOS(.v14)],
+              products: [.executable(name: "port-smoke", targets: ["PortSmoke"])],
+              targets: [.target(name: "AltStore"), .executableTarget(name: "PortSmoke"), .testTarget(name: "DiscoveryTests", dependencies: ["AltStore"])],
+              swiftLanguageModes: [.v5]
+          )
+          ''')
+          (package / 'Sources/PortSmoke/Smoke.swift').write_text('''import Foundation
+          import Network
+          import dnssd
+
+          @main struct PortSmoke {
+              @MainActor static func main() async throws {
+                  let type = CommandLine.arguments[1]
+                  let expected = UInt16(CommandLine.arguments[2])!
+                  var reference: DNSServiceRef?
+                  let error = DNSServiceRegister(&reference, 0, kDNSServiceInterfaceIndexLocalOnly,
+                      "AltStore port smoke", type, "local.", nil, expected.bigEndian, 0, nil,
+                      { _, _, _, _, _, _, _ in }, nil)
+                  guard error == kDNSServiceErr_NoError, let reference else {
+                      throw NSError(domain: "Registration", code: Int(error))
+                  }
+                  defer { DNSServiceRefDeallocate(reference) }
+                  guard DNSServiceSetDispatchQueue(reference, .main) == kDNSServiceErr_NoError else {
+                      throw NSError(domain: "RegistrationQueue", code: 1)
+                  }
+                  guard let port = await LocalServiceDiscovery.port(for: type), port == expected else {
+                      throw NSError(domain: "WrongDiscoveredPort", code: 1)
+                  }
+                  let connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
+                  defer { connection.cancel() }
+                  connection.start(queue: .main)
+                  let received: Data = try await withCheckedThrowingContinuation { continuation in
+                      connection.send(content: Data("ping".utf8), completion: .contentProcessed { error in
+                          if let error { continuation.resume(throwing: error); return }
+                          connection.receive(minimumIncompleteLength: 4, maximumLength: 4) { data, _, _, error in
+                              if let error { continuation.resume(throwing: error); return }
+                              continuation.resume(returning: data ?? Data())
+                          }
+                      })
+                  }
+                  guard received == Data("pong".utf8) else { throw NSError(domain: "Roundtrip", code: 1) }
+                  print("SMOKE PASS: local DNS-SD discovered server port \\(port); real TCP ping/pong succeeded")
+              }
+          }
+          ''')
+          subprocess.run(['xcodebuild', '-version'], check=True)
+          subprocess.run(['swift', '--version'], check=True)
+          subprocess.run(['plutil', '-lint', 'AltStore/Info.plist', 'AltStore.xcodeproj/project.pbxproj'], check=True)
+          sdk = subprocess.check_output(['xcrun', '--sdk', 'iphonesimulator', '--show-sdk-path'], text=True).strip()
+          subprocess.run(['xcrun', '--sdk', 'iphonesimulator', 'swiftc', '-typecheck', '-swift-version', '5', '-target', platform.machine() + '-apple-ios17.4-simulator', '-sdk', sdk, str(source)], check=True)
+          subprocess.run(['xcrun', 'swiftc', '-frontend', '-parse', str(repo / 'AltStore/Managing Apps/OnDeviceClient.swift')], check=True)
+          subprocess.run(['swift', 'test', '--package-path', str(package)], check=True, timeout=240)
+          subprocess.run(['swift', 'build', '--package-path', str(package), '--product', 'port-smoke'], check=True, timeout=120)
+          binary_dir = subprocess.check_output(['swift', 'build', '--package-path', str(package), '--show-bin-path'], text=True).strip()
+          with socket.socket() as server:
+              try:
+                  server.bind(('127.0.0.1', 49621))
+              except OSError:
+                  server.bind(('127.0.0.1', 0))
+              server.listen(1)
+              server.settimeout(30)
+              port = server.getsockname()[1]
+              failures = []
+              def serve():
+                  try:
+                      connection, _ = server.accept()
+                      with connection:
+                          connection.settimeout(10)
+                          if connection.recv(4) != b'ping':
+                              raise RuntimeError('Unexpected smoke request')
+                          connection.sendall(b'pong')
+                  except Exception as error:
+                      failures.append(error)
+              thread = threading.Thread(target=serve, daemon=True)
+              thread.start()
+              subprocess.run([str(pathlib.Path(binary_dir) / 'port-smoke'), '_altstore-smoke._tcp', str(port)], check=True, timeout=30)
+              thread.join(timeout=10)
+              if failures or thread.is_alive():
+                  raise RuntimeError(f'TCP server failed: {failures}')
+          print('Validation scope: production DNS-SD runtime, regression tests, iOS simulator SDK typecheck, client syntax. No full app build or physical-iPhone validation.')
